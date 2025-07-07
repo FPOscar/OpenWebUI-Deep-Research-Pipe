@@ -300,65 +300,7 @@ GUIDELINES:
                         except Exception:
                             pass
 
-    async def poll_response(self, response_id: str, headers: dict) -> dict:
-        """Poll a background response until completion"""
-        
-        attempts = 0
-        
-        async with httpx.AsyncClient(timeout=30) as client:
-            while attempts < self.valves.MAX_POLL_ATTEMPTS:
-                try:
-                    response = await client.get(
-                        f"{self.valves.BASE_URL}/responses/{response_id}",
-                        headers=headers
-                    )
-                    
-                    if response.status_code != 200:
-                        raise Exception(f"Failed to poll response: {response.status_code}")
-                    
-                    resp_data = response.json()
-                    status = resp_data.get("status")
-                    
-                    if status not in ["queued", "in_progress"]:
-                        return resp_data
-                    
-                    await asyncio.sleep(self.valves.POLL_INTERVAL)
-                    attempts += 1
-                    
-                except Exception as e:
-                    logger.error(f"Error polling response: {e}")
-                    await asyncio.sleep(self.valves.POLL_INTERVAL)
-                    attempts += 1
-        
-        raise Exception(f"Polling timeout after {attempts} attempts")
-    
-    async def test_api_key(self, headers: dict) -> bool:
-        """Test if the API key works with a simple model"""
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                # Test with a simple completion
-                test_payload = {
-                    "model": "gpt-3.5-turbo",
-                    "messages": [{"role": "user", "content": "test"}],
-                    "max_tokens": 5
-                }
-                
-                response = await client.post(
-                    f"{self.valves.BASE_URL}/chat/completions",
-                    json=test_payload,
-                    headers=headers
-                )
-                
-                print(f"API key test - Status: {response.status_code}")
-                if response.status_code == 200:
-                    print("API key is valid")
-                    return True
-                else:
-                    print(f"API key test failed: {response.text}")
-                    return False
-        except Exception as e:
-            print(f"API key test error: {e}")
-            return False
+    def format_output_for_streaming(self, response_data: dict) -> List[Dict[str, Any]]:
         """Format the complete response for streaming output"""
         
         chunks = []
