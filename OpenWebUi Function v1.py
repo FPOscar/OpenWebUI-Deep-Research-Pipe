@@ -83,6 +83,14 @@ class Pipe:
             default="gpt-4-turbo-preview",
             description="Model to use as fallback if deep research models aren't available",
         )
+        REQUEST_TIMEOUT: int = Field(
+            default=120,
+            description="Timeout in seconds for API requests (increase if getting timeout errors)",
+        )
+        CONNECTION_TIMEOUT: int = Field(
+            default=30,
+            description="Timeout in seconds for establishing connections to the API",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -176,47 +184,146 @@ GUIDELINES:
         print(f"Creating background response with payload: {json.dumps(payload, indent=2)}")
         print(f"POST URL: {self.valves.BASE_URL}/responses")
         
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                f"{self.valves.BASE_URL}/responses",
-                json=payload,
-                headers=headers
-            )
-            
-            print(f"Response status: {response.status_code}")
-            print(f"Response headers: {dict(response.headers)}")
-            
-            # Get the raw response text first
-            response_text = await response.aread()
-            print(f"Raw response length: {len(response_text)} bytes")
-            print(f"Raw response (first 500 chars): {response_text[:500]}")
-            
-            # Accept 200, 201, or 202 for async operations
-            if response.status_code not in [200, 201, 202]:
-                print(f"Error response: {response_text.decode('utf-8')}")
-                raise Exception(f"Failed to create response: {response.status_code} {response_text.decode('utf-8')}")
-            
-            # Handle empty response
-            if not response_text:
-                raise Exception(
-                    "Empty response received from API. This usually means:\n"
-                    "1. Your API key doesn't have access to deep research models (o3-deep-research, o4-mini-deep-research)\n"
-                    "2. These models require special access from OpenAI\n"
-                    "3. Try enabling TEST_MODE in Valves to verify your API key works with other models"
-                )
-            
-            # Try to parse as JSON
+        # Use configurable timeout for background response creation
+        # Background responses may take longer to initialize
+        timeout = httpx.Timeout(
+            connect=self.valves.CONNECTION_TIMEOUT,
+            read=self.valves.REQUEST_TIMEOUT,
+            write=self.valves.CONNECTION_TIMEOUT,
+            pool=self.valves.CONNECTION_TIMEOUT
+        )
+        
+        async with httpx.AsyncClient(timeout=timeout) as client:
             try:
-                result = json.loads(response_text)
-                print(f"Response parsed successfully: {json.dumps(result, indent=2)[:500]}")
-                return result
-            except json.JSONDecodeError as e:
-                print(f"Failed to parse JSON: {e}")
-                print(f"Response content-type: {response.headers.get('content-type')}")
-                # Check if it's HTML (common for auth errors)
-                if response_text.startswith(b'<!DOCTYPE') or response_text.startswith(b'<html'):
-                    raise Exception("Received HTML response instead of JSON - likely an authentication or endpoint error")
-                raise Exception(f"Invalid JSON response: {response_text.decode('utf-8')[:200]}")
+                response = await client.post(
+                    f"{self.valves.BASE_URL}/responses",
+                    json=payload,
+                    headers=headers
+                )
+                
+                print(f"Response status: {response.status_code}")
+                print(f"Response headers: {dict(response.headers)}")
+                
+                # Accept 200, 201, or 202 for async operations
+                if response.status_code not in [200, 201, 202]:
+                    # Try to get error details without reading full response
+                    try:
+                        error_text = await response.aread()
+                        error_msg = error_text.decode('utf-8')
+                    except:
+                        error_msg = f"HTTP {response.status_code}"
+                    print(f"Error response: {error_msg}")
+                    raise Exception(f"Failed to create response: {response.status_code} {error_msg}")
+                
+                # For background responses, we might get a response immediately with just the ID
+                # Try to read the response, but handle timeout gracefully
+                try:
+                    response_text = await response.aread()
+                    print(f"Raw response length: {len(response_text)} bytes")
+                    print(f"Raw response (first 500 chars): {response_text[:500]}")
+                    
+                    # Handle empty response
+                    if not response_text:
+                        raise Exception(
+                            "Empty response received from API. This usually means:\n"
+                            "1. Your API key doesn't have access to deep research models (o3-deep-research, o4-mini-deep-research)\n"
+                            "2. These models require special access from OpenAI\n"
+                            "3. Try enabling TEST_MODE in Valves to verify your API key works with other models"
+                        )
+                    
+                    # Check if this is an SSE (Server-Sent Events) response
+                    response_text_str = response_text.decode('utf-8')
+                    if response_text_str.startswith('event:') or 'data:' in response_text_str:
+                        print("Detected SSE format response")
+                        # Parse SSE format to extract JSON data
+                        lines = response_text_str.strip().split('\n')
+                        json_data = None
+                        
+                        for line in lines:
+                            if line.startswith('data:'):
+                                json_str = line[5:].strip()  # Remove 'data:' prefix
+                                try:
+                                    json_data = json.loads(json_str)
+                                    break
+                                except json.JSONDecodeError:
+                                    continue
+                        
+                        if json_data:
+                            print(f"Extracted JSON from SSE: {json.dumps(json_data, indent=2)[:500]}")
+                            
+                            # For SSE response.created events, extract the response object
+                            if json_data.get("type") == "response.created":
+                                response_obj = json_data.get("response", {})
+                                response_id = response_obj.get("id")
+                                if not response_id:
+                                    print("Warning: No response ID found in SSE response")
+                                    print(f"Full response object: {json.dumps(response_obj, indent=2)}")
+                                return {
+                                    "id": response_id,
+                                    "status": response_obj.get("status", "queued"),
+                                    "object": response_obj.get("object"),
+                                    "created_at": response_obj.get("created_at")
+                                }
+                            else:
+                                return json_data
+                        else:
+                            raise Exception("Could not extract JSON data from SSE response")
+                    
+                    # Try to parse as regular JSON
+                    try:
+                        result = json.loads(response_text_str)
+                        print(f"Response parsed successfully: {json.dumps(result, indent=2)[:500]}")
+                        return result
+                    except json.JSONDecodeError as e:
+                        print(f"Failed to parse JSON: {e}")
+                        print(f"Response content-type: {response.headers.get('content-type')}")
+                        # Check if it's HTML (common for auth errors)
+                        if response_text_str.startswith('<!DOCTYPE') or response_text_str.startswith('<html'):
+                            raise Exception("Received HTML response instead of JSON - likely an authentication or endpoint error")
+                        raise Exception(f"Invalid JSON response: {response_text_str[:200]}")
+                        
+                except httpx.ReadTimeout:
+                    # Handle read timeout for background responses
+                    print("Read timeout occurred - this is expected for background responses")
+                    print("The response was likely accepted but is processing in the background")
+                    
+                    # For background responses, we might need to extract the response ID from headers
+                    # or return a minimal response object that indicates the request was accepted
+                    if response.status_code == 202:
+                        # HTTP 202 Accepted - request accepted for processing
+                        return {
+                            "id": "background_processing",
+                            "status": "queued",
+                            "message": "Request accepted for background processing"
+                        }
+                    else:
+                        # If we got a 200/201 but timeout reading, the response might be processing
+                        # Try to get any immediate response data from headers
+                        location = response.headers.get('location')
+                        if location:
+                            # Extract ID from location header if available
+                            response_id = location.split('/')[-1]
+                            return {
+                                "id": response_id,
+                                "status": "queued",
+                                "message": "Background processing started"
+                            }
+                        else:
+                            # Last resort - return a generic response
+                            return {
+                                "id": "processing",
+                                "status": "in_progress",
+                                "message": "Background processing in progress"
+                            }
+                            
+            except httpx.ConnectTimeout:
+                raise Exception("Connection timeout - unable to connect to OpenAI API")
+            except httpx.ReadTimeout:
+                raise Exception("Request timeout - the API took too long to respond")
+            except Exception as e:
+                if "ReadTimeout" in str(e):
+                    raise Exception("Request timeout - this may be due to API load or network issues")
+                raise
 
     async def poll_response(self, response_id: str, headers: dict) -> dict:
         """Poll a background response until completion"""
@@ -565,7 +672,15 @@ GUIDELINES:
                 yield {
                     "choices": [{
                         "delta": {
-                            "content": f"🔗 API Endpoint: {self.valves.BASE_URL}/responses\n\n"
+                            "content": f"🔗 API Endpoint: {self.valves.BASE_URL}/responses\n"
+                        }
+                    }]
+                }
+                
+                yield {
+                    "choices": [{
+                        "delta": {
+                            "content": f"⚙️ Timeout Settings: {self.valves.REQUEST_TIMEOUT}s read, {self.valves.CONNECTION_TIMEOUT}s connect\n\n"
                         }
                     }]
                 }
@@ -575,20 +690,71 @@ GUIDELINES:
                     response_id = response.get("id")
                     status = response.get("status")
                     
+                    print(f"Background response created - ID: {response_id}, Status: {status}")
+                    
                     if not response_id:
-                        yield f"Error: Failed to get response ID from response: {json.dumps(response)}"
+                        yield {
+                            "choices": [{
+                                "delta": {
+                                    "content": f"Error: Failed to get response ID from response: {json.dumps(response)}\n"
+                                }
+                            }]
+                        }
+                        return
+                    
+                    # Handle special case where we don't have a real response ID due to timeout
+                    if response_id in ["background_processing", "processing"]:
+                        yield {
+                            "choices": [{
+                                "delta": {
+                                    "content": "⚠️ Background response creation timed out. This is often due to high API load.\n"
+                                }
+                            }]
+                        }
+                        
+                        yield {
+                            "choices": [{
+                                "delta": {
+                                    "content": "� Try again in a few moments, or enable TEST_MODE to verify your API key has access to deep research models.\n"
+                                }
+                            }]
+                        }
+                        
+                        yield {
+                            "choices": [{
+                                "delta": {},
+                                "finish_reason": "stop"
+                            }]
+                        }
                         return
                     
                     yield {
                         "choices": [{
                             "delta": {
-                                "content": f"📋 Research ID: {response_id}\n📊 Initial Status: {status}\n"
+                                "content": f"�📋 Research ID: {response_id}\n📊 Initial Status: {status}\n"
                             }
                         }]
                     }
                     
                 except Exception as e:
-                    yield f"Error creating background response: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+                    error_msg = str(e)
+                    yield f"Error creating background response: {error_msg}\n"
+                    
+                    # Provide helpful guidance based on error type
+                    if "timeout" in error_msg.lower():
+                        yield "\n💡 **Timeout Solutions:**\n"
+                        yield "- OpenAI's deep research models can be slow to initialize\n"
+                        yield "- Try again in a few moments when API load is lower\n"
+                        yield f"- Current timeout settings: {self.valves.REQUEST_TIMEOUT}s read, {self.valves.CONNECTION_TIMEOUT}s connect\n"
+                        yield "- You can increase REQUEST_TIMEOUT in Valves if needed\n"
+                        yield "- Enable TEST_MODE to verify your API key works with other models\n"
+                        yield "- Check if your API key has access to o3-deep-research/o4-mini-deep-research\n"
+                    elif "authentication" in error_msg.lower() or "unauthorized" in error_msg.lower():
+                        yield "\n🔑 **Authentication Issues:**\n"
+                        yield "- Verify your API key is correct\n"
+                        yield "- Ensure your API key has access to deep research models\n"
+                        yield "- These models require special access from OpenAI\n"
+                    
                     return
                 
                 # For background mode, we should poll until completion
@@ -607,56 +773,94 @@ GUIDELINES:
                         await asyncio.sleep(self.valves.POLL_INTERVAL)
                         poll_count += 1
                         
-                        # Poll for status
-                        async with httpx.AsyncClient(timeout=30) as client:
-                            response = await client.get(
-                                f"{self.valves.BASE_URL}/responses/{response_id}",
-                                headers=headers
+                        # Skip polling if we don't have a real response ID
+                        if response_id in ["background_processing", "processing"]:
+                            yield {
+                                "choices": [{
+                                    "delta": {
+                                        "content": "⚠️ Cannot poll background response - no valid response ID\n"
+                                    }
+                                }]
+                            }
+                            break
+                        
+                        # Poll for status with timeout handling
+                        try:
+                            timeout = httpx.Timeout(
+                                connect=self.valves.CONNECTION_TIMEOUT,
+                                read=30.0,  # Polling requests should be quick
+                                write=self.valves.CONNECTION_TIMEOUT,
+                                pool=self.valves.CONNECTION_TIMEOUT
                             )
                             
-                            if response.status_code != 200:
-                                yield f"Error polling response: {response.status_code} {response.text}"
-                                return
-                            
-                            resp_data = response.json()
-                            status = resp_data.get("status")
-                            
-                            print(f"Poll {poll_count}: Status = {status}")
-                            
-                            # Provide periodic status updates
-                            if poll_count % 10 == 0:  # Every 30 seconds
-                                yield {
-                                    "choices": [{
-                                        "delta": {
-                                            "content": f"⏳ Still researching... (Status: {status}, Time: ~{poll_count * self.valves.POLL_INTERVAL}s)\n"
-                                        }
-                                    }]
-                                }
-                            
-                            if status == "completed":
-                                # Stream the complete response
-                                yield {
-                                    "choices": [{
-                                        "delta": {
-                                            "content": "\n✅ Research completed! Here are the results:\n\n"
-                                        }
-                                    }]
-                                }
+                            async with httpx.AsyncClient(timeout=timeout) as client:
+                                response = await client.get(
+                                    f"{self.valves.BASE_URL}/responses/{response_id}",
+                                    headers=headers
+                                )
                                 
-                                print(f"Final response data keys: {list(resp_data.keys())}")
+                                if response.status_code != 200:
+                                    yield f"Error polling response: {response.status_code} {response.text}"
+                                    return
                                 
-                                for chunk in self.format_output_for_streaming(resp_data):
-                                    yield chunk
-                                return
+                                resp_data = response.json()
+                                status = resp_data.get("status")
                                 
-                            elif status == "failed":
-                                error_msg = resp_data.get("error", {}).get("message", "Unknown error")
-                                yield f"Error: Research failed - {error_msg}"
-                                return
+                                print(f"Poll {poll_count}: Status = {status}")
                                 
-                            elif status == "cancelled":
-                                yield "Error: Research was cancelled"
-                                return
+                                # Provide periodic status updates
+                                if poll_count % 10 == 0:  # Every 30 seconds
+                                    yield {
+                                        "choices": [{
+                                            "delta": {
+                                                "content": f"⏳ Still researching... (Status: {status}, Time: ~{poll_count * self.valves.POLL_INTERVAL}s)\n"
+                                            }
+                                        }]
+                                    }
+                                
+                                if status == "completed":
+                                    # Stream the complete response
+                                    yield {
+                                        "choices": [{
+                                            "delta": {
+                                                "content": "\n✅ Research completed! Here are the results:\n\n"
+                                            }
+                                        }]
+                                    }
+                                    
+                                    print(f"Final response data keys: {list(resp_data.keys())}")
+                                    
+                                    for chunk in self.format_output_for_streaming(resp_data):
+                                        yield chunk
+                                    return
+                                    
+                                elif status == "failed":
+                                    error_msg = resp_data.get("error", {}).get("message", "Unknown error")
+                                    yield f"Error: Research failed - {error_msg}"
+                                    return
+                                    
+                                elif status == "cancelled":
+                                    yield "Error: Research was cancelled"
+                                    return
+                                    
+                        except httpx.TimeoutException:
+                            yield {
+                                "choices": [{
+                                    "delta": {
+                                        "content": f"⚠️ Polling timeout (attempt {poll_count}), retrying...\n"
+                                    }
+                                }]
+                            }
+                            continue
+                        except Exception as poll_error:
+                            yield {
+                                "choices": [{
+                                    "delta": {
+                                        "content": f"⚠️ Polling error (attempt {poll_count}): {str(poll_error)}\n"
+                                    }
+                                }]
+                            }
+                            continue
                     
                     yield f"Error: Polling timeout after {poll_count * self.valves.POLL_INTERVAL} seconds. The research may still be running on OpenAI's servers."
                     
