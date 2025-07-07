@@ -1,7 +1,7 @@
 """
 title: OpenAI Deep Research Pipe
-author_url: https://github.com/your-repo
-author: Your Name
+author_url: https://github.com/FPOscar/OpenWebUI-Deep-Research-Pipe
+author: Oscar
 version: 0.0.2
 license: MIT
 description: OpenAI Deep Research implementation with o3-deep-research and o4-mini-deep-research models. NOTE: These models require special access from OpenAI.
