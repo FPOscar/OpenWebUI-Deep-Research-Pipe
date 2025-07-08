@@ -2,7 +2,7 @@
 title: OpenAI Deep Research Pipe
 author_url: https://github.com/FPOscar/OpenWebUI-Deep-Research-Pipe
 author: Oscar
-version: 0.0.2
+version: 0.0.3
 license: MIT
 description: OpenAI Deep Research implementation with o3-deep-research and o4-mini-deep-research models. NOTE: These models require special access from OpenAI.
 """
@@ -543,29 +543,29 @@ GUIDELINES:
             yield f"Error: Invalid model '{model_id}'. Available models: {', '.join(self.deep_research_models)}"
             return
         
-        # Extract the user's research query
-        messages = body.get("messages", [])
-        if not messages:
-            yield "Error: No messages provided"
-            return
-            
-        # Get the last user message as the research input
-        user_input = None
-        for message in reversed(messages):
-            if message.get("role") == "user":
-                if isinstance(message.get("content"), list):
-                    for content in message["content"]:
-                        if content.get("type") == "text":
-                            user_input = content.get("text")
-                            break
-                else:
-                    user_input = message.get("content")
-                break
-        
+        # --- 1️⃣   slice the incoming messages --------------------------------------
+        messages: list = body.get("messages", [])
+
+        # (a) All system messages – concatenate if the UI lets users stack them)
+        system_instructions = "\n\n".join(
+            m["content"] for m in messages if m.get("role") == "system"
+        ).strip()
+
+        # (b) The latest user message (unchanged logic, but fall back gracefully)
+        user_input = next(
+            (
+                m["content"]
+                if isinstance(m["content"], str)
+                else "".join(p.get("text", "") for p in m["content"])
+                for m in reversed(messages)
+                if m.get("role") == "user"
+            ),
+            None,
+        )
         if not user_input:
             yield "Error: No user input found"
             return
-        
+            
         # Test mode - just echo back to verify pipe is working
         if self.valves.TEST_MODE:
             yield {
@@ -616,6 +616,10 @@ GUIDELINES:
             "tools": [],
             "store": True  # Required for background mode
         }
+
+        # Only add instructions if the user actually supplied a system prompt
+        if system_instructions:
+            payload["instructions"] = system_instructions
         
         # Add tools based on configuration
         if self.valves.ENABLE_WEB_SEARCH:
